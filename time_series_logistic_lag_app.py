@@ -1,6 +1,4 @@
 
-# Final Version: Streamlit App for GOOG Lag Prediction
-# Includes: TimeSeriesSplit, VIF, SHAP, LIME, Autocorrelation, ADF Test, Seasonality
 import streamlit as st
 import pandas as pd
 import numpy as np
