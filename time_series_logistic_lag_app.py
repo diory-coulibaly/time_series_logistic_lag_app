@@ -13,17 +13,18 @@ from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.graphics.tsaplots import plot_acf
 from statsmodels.tsa.stattools import adfuller
+from scipy.stats import ks_2samp
 import shap
 from lime.lime_tabular import LimeTabularExplainer
 
 st.set_page_config(page_title="GOOG Lag Prediction", layout="wide")
+st.title("📈 GOOG Direction Prediction with Full Time Series & Drift Analysis")
+st.set_page_config(page_title="GOOG Lag Prediction", layout="wide")
 st.title("📈 GOOG Direction Prediction with Enhanced Time Series Analysis")
 # 📷 Quick preview of expected CSV format
 from PIL import Image
-image = Image.open("Goog.JPG")
-st.image(image, caption="CSV Format: Stocks,SP500", use_container_width=True, output_format="JPEG")
 
-
+# Sidebar
 with st.sidebar:
     st.header("1. Upload Files")
     goog_file = st.file_uploader("GOOG CSV (semicolon-separated)", type="csv")
@@ -49,7 +50,6 @@ def load_data(gfile, sfile):
     return df.dropna().reset_index(drop=True)
 
 def prepare_features(df, lags):
-    df = df.copy()
     for lag in lags:
         df[f"goog_lag{lag}"] = df["goog_ret"].shift(-lag)
         df[f"sp_lag{lag}"] = df["sp_ret"].shift(-lag)
@@ -70,8 +70,7 @@ if run_button and goog_file and sp500_file:
     df_raw = load_data(goog_file, sp500_file)
 
     st.header("🔍 Time Series Pattern Detection")
-
-    st.subheader("📉 Mean Reversion (ADF Test)")
+    st.subheader("📉 ADF Test (Stationarity)")
     adf_result = adfuller(df_raw["goog_ret"].dropna())
     st.write(f"ADF Statistic: {adf_result[0]:.3f}")
     st.write(f"p-value: {adf_result[1]:.3f}")
@@ -80,7 +79,7 @@ if run_button and goog_file and sp500_file:
     else:
         st.warning("Not Mean Reverting")
 
-    st.subheader("⚡ Momentum (Autocorrelation)")
+    st.subheader("⚡ Autocorrelation")
     fig, ax = plt.subplots(figsize=(8, 4))
     plot_acf(df_raw["goog_ret"].dropna(), lags=20, ax=ax)
     st.pyplot(fig)
@@ -90,33 +89,56 @@ if run_button and goog_file and sp500_file:
     df_raw["Month"] = df_raw["Date"].dt.month
     col1, col2 = st.columns(2)
     with col1:
-        weekday_avg = df_raw.groupby("Weekday")["goog_ret"].mean()
-        weekday_avg.plot(kind="bar", title="Avg Return by Weekday")
+        df_raw.groupby("Weekday")["goog_ret"].mean().plot(kind="bar", title="Avg Return by Weekday")
         st.pyplot(plt.gcf())
     with col2:
-        month_avg = df_raw.groupby("Month")["goog_ret"].mean()
-        month_avg.plot(kind="bar", title="Avg Return by Month")
+        df_raw.groupby("Month")["goog_ret"].mean().plot(kind="bar", title="Avg Return by Month")
         st.pyplot(plt.gcf())
 
-    df_lagged, features = prepare_features(df_raw, lags)
-    X = df_lagged[features]
-    y = df_lagged["goog_up"]
+    df, features = prepare_features(df_raw, lags)
+    X = df[features]
+    y = df["goog_up"]
 
-    st.subheader("🔢 Multicollinearity (VIF)")
+    st.subheader("🔢 VIF - Multicollinearity")
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    vif_data = pd.DataFrame()
-    vif_data["Feature"] = features
-    vif_data["VIF"] = [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]
-    st.write(vif_data)
+    vif_df = pd.DataFrame({"Feature": features, "VIF": [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]})
+    st.write(vif_df)
 
+    # --- Drift Detection Section ---
+    st.subheader("📉 Drift Detection (PSI & KS Test)")
+    cutoff = int(0.5 * len(X))
+    X_ref, X_new = X.iloc[:cutoff], X.iloc[cutoff:]
+
+    def calculate_psi(ref, new, buckets=10):
+        psi_total = 0
+        for i in range(ref.shape[1]):
+            ref_col = pd.qcut(ref.iloc[:, i], q=buckets, duplicates='drop')
+            new_col = pd.qcut(new.iloc[:, i], q=buckets, duplicates='drop')
+            ref_dist = ref_col.value_counts(normalize=True, sort=False)
+            new_dist = new_col.value_counts(normalize=True, sort=False)
+            all_bins = set(ref_dist.index).union(new_dist.index)
+            for bin_ in all_bins:
+                ref_pct = ref_dist.get(bin_, 0.0001)
+                new_pct = new_dist.get(bin_, 0.0001)
+                psi = (ref_pct - new_pct) * np.log(ref_pct / new_pct)
+                psi_total += psi
+        return psi_total
+
+    ks_results = [{"Feature": f, "KS Stat": ks_2samp(X_ref[f], X_new[f])[0], "p-value": ks_2samp(X_ref[f], X_new[f])[1]} for f in features]
+    st.dataframe(pd.DataFrame(ks_results))
+    psi_score = calculate_psi(X_ref, X_new)
+    st.write(f"PSI (Population Stability Index): **{psi_score:.4f}**")
+
+    # --- Modeling & Results ---
     model = select_model(model_type)
     tscv = TimeSeriesSplit(n_splits=splits)
-    metrics = []
     preds_df = pd.DataFrame()
-    for train_index, test_index in tscv.split(X):
-        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+    metrics = []
+
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else y_pred
@@ -125,57 +147,50 @@ if run_button and goog_file and sp500_file:
             "Accuracy": accuracy_score(y_test, y_pred),
             "Precision": precision_score(y_test, y_pred),
             "Recall": recall_score(y_test, y_pred),
-            "F1 Score": f1_score(y_test, y_pred),
+            "F1": f1_score(y_test, y_pred),
             "AUC": roc_auc_score(y_test, y_proba)
         })
+
     df_metrics = pd.DataFrame(metrics).mean().round(3)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Metrics", "📉 ROC Curve", "📌 Feature Importance", "🤔 SHAP", "🔍 LIME"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Metrics", "📈 ROC", "📌 Importance", "🤔 SHAP", "🔍 LIME"])
 
     with tab1:
-        st.subheader("Average Cross-Validation Metrics")
+        st.subheader("Average Metrics")
         st.write(df_metrics.T)
-        st.dataframe(preds_df.head(10))
-        st.download_button("⬇️ Download Predictions", preds_df.to_csv(index=False), "predictions.csv")
+        st.dataframe(preds_df.head())
+        st.download_button("Download Predictions", preds_df.to_csv(index=False), "preds.csv")
 
     with tab2:
-        st.subheader("Mean ROC Curve")
         model.fit(X, y)
-        proba = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else model.predict(X)
-        fpr, tpr, _ = roc_curve(y, proba)
-        plt.figure(figsize=(6, 4))
-        plt.plot(fpr, tpr, label=f"AUC = {roc_auc_score(y, proba):.2f}")
-        plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve")
-        plt.legend()
+        probas = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else model.predict(X)
+        fpr, tpr, _ = roc_curve(y, probas)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f"AUC={roc_auc_score(y, probas):.2f}")
+        plt.plot([0,1],[0,1],'--')
+        plt.xlabel("FPR")
+        plt.ylabel("TPR")
         st.pyplot(plt.gcf())
 
     with tab3:
-        st.subheader("Feature Importance")
         if hasattr(model, "feature_importances_"):
             fi = pd.DataFrame({"Feature": features, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
             sns.barplot(x="Importance", y="Feature", data=fi)
-            st.pyplot(plt.gcf())
         elif hasattr(model, "coef_"):
             coefs = pd.DataFrame({"Feature": features, "Coefficient": model.coef_[0]})
             sns.barplot(x="Coefficient", y="Feature", data=coefs)
-            st.pyplot(plt.gcf())
-        else:
-            st.info("Feature importance not available for this model.")
+        st.pyplot(plt.gcf())
 
     with tab4:
-        st.subheader("SHAP Explanation")
         explainer = shap.Explainer(model, X)
-        shap_values = explainer(pd.DataFrame(X, columns=features))
-        shap.summary_plot(shap_values, X, show=False)
+        shap_vals = explainer(pd.DataFrame(X, columns=features))
+        shap.summary_plot(shap_vals, X, show=False)
         st.pyplot(plt.gcf())
 
     with tab5:
-        st.subheader("LIME Explanation (first sample)")
         explainer = LimeTabularExplainer(X.values, feature_names=features, class_names=["Down", "Up"], discretize_continuous=True)
         exp = explainer.explain_instance(X.iloc[0].values, lambda x: model.predict_proba(pd.DataFrame(x, columns=features)), num_features=5)
         st.text(exp.as_list())
+
 else:
-    st.info("⬅️ Upload files, choose settings, and run the model.")
+    st.info("⬅️ Upload your CSVs and click Run Model.")
