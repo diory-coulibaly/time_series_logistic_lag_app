@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: time_series_logistic_lag_app
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run time_series_logistic_lag_app.py --server.port 8080 --server.enableCORS false
